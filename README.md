@@ -14,6 +14,8 @@ Traditional IVRs require callers to navigate numeric keypads, while letting an L
 
 ## Demo
 
+Jev handling 10 incoming calls simultaneously in real time, classifying caller intent across active lanes and routing each to its target queue:
+
 [<video src="docs/demo.mp4" controls width="100%"></video>](https://github.com/user-attachments/assets/55f709fb-32ef-410b-b138-8155e08af879)
 
 ## Call flow
