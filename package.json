@@ -1,0 +1,23 @@
+{
+  "name": "jev-call-router",
+  "version": "0.1.0",
+  "description": "Programmable call-routing decision layer for PBX systems, using Jev by TypeSafe AI.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "simulate": "bun run scripts/simulate.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
+    "@typesafe-ai/sdk": "^0.6.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
+}
