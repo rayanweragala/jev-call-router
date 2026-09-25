@@ -13,3 +13,5 @@ export { connectAsterisk, type AsteriskAdapterOptions, type AsteriskConnection }
 export { parseDialplanTarget, validateAsteriskRoutes } from "./pbx/asterisk/dialplan.ts";
 export * from "./types.ts";
 export { createScriptedSession, textSpeech, type ScriptedSession } from "./testing.ts";
+export { sendWebhook, type WebhookConfig } from "./webhook.ts";
+export { eventHub, type RouterEvent, type RouterEventName } from "./events.ts";

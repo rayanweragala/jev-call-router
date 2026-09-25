@@ -12,6 +12,10 @@ Traditional IVRs require callers to navigate numeric keypads, while letting an L
 - Jev selects from defined routes and returns a typed answer with a confidence score.
 - Low confidence, outages, or unhandled requests route to a designated fallback.
 
+## Demo
+
+[<video src="docs/demo.mp4" controls width="100%"></video>](https://github.com/user-attachments/assets/55f709fb-32ef-410b-b138-8155e08af879)
+
 ## Call flow
 
 ```
@@ -31,6 +35,8 @@ Incoming call → Asterisk / FreePBX dialplan → Stasis(jev-router)
       └─ ok                              → route.action
       ↓
   PBX executes: transfer to a dialplan destination, continue in the dialplan, or hang up
+      ↓
+  onResult(result) ──▶ outbound webhook (optional) + live visualizer event
 ```
 
 ## Architecture
@@ -39,16 +45,21 @@ Incoming call → Asterisk / FreePBX dialplan → Stasis(jev-router)
 src/
   types.ts            Public types: routes, actions, providers, sessions, results
   config.ts           Validation, defaults, requireEnv
-  router.ts           The call flow above (createCallRouter)
+  router.ts           Call flow implementation (createCallRouter)
   jev.ts              Jev decision provider (official @typesafe-ai/sdk)
   logger.ts           Structured JSON logging
+  events.ts           Event hub for live SSE subscribers
+  webhook.ts          Outbound signed HTTP webhook delivery
+  http.ts             Server for visualizer assets and SSE streams
+  demo-server.ts      Demo runner (bun run demo)
   providers/
     speech.ts         Speech-to-text over any OpenAI-style /audio/transcriptions API
     interpreter.ts    Optional Claude interpreter that summarizes and removes personal details
-  pbx/asterisk/       Asterisk ARI adapter (no dependency: fetch + WebSocket)
+  pbx/asterisk/       Asterisk ARI adapter (fetch + WebSocket)
   testing.ts          Scripted call session for tests and simulations
   server.ts           Service entry point (bun start)
 router.config.ts      Your routes and providers
+public/index.html     Live dispatcher visualizer
 ```
 
 The core (`router.ts`, `jev.ts`, `types.ts`) knows nothing about Asterisk. A PBX adapter only has to implement `CallSession`:
@@ -86,6 +97,9 @@ cp .env.example .env    # then fill in values; .env is gitignored
 | `ARI_URL`, `ARI_USERNAME`, `ARI_PASSWORD` | yes for `bun start` | Asterisk REST Interface |
 | `ARI_APP` | no | Stasis app name (default `jev-router`) |
 | `ANTHROPIC_API_KEY` | only with the interpreter | Claude interpreter |
+| `WEBHOOK_URL` | no | Endpoint to receive routing outcomes via HTTP POST |
+| `WEBHOOK_SECRET` | no | Key for signing webhook payloads with HMAC-SHA256 |
+| `PORT` | no | HTTP visualizer and SSE port (default `3000`) |
 
 ### Jev configuration
 
@@ -111,6 +125,9 @@ const router = createCallRouter({
   },
   fallbackRoute: "human-agent",
   prompts: { greeting: "sound:custom/jev-greeting" },
+  onResult: (result) => {
+    // Deliver to external webhook, CRM, or audit store
+  },
 });
 
 await router.handleCall(session);                               // a CallSession from a PBX adapter
@@ -149,7 +166,71 @@ Step-by-step setup: [docs/INTEGRATION.md](docs/INTEGRATION.md).
 bun start                                              # connect to Asterisk and route calls
 bun run simulate "I think I was charged twice"         # full call flow with text instead of audio, real Jev
 bun run simulate "hello?" "I need to pay my invoice"   # second utterance answers the retry prompt
+bun run demo                                           # start visualizer on http://localhost:3000
 ```
+
+## Live visualizer
+
+Run `bun run demo` and open `http://localhost:3000`.
+
+The visualizer shows up to 10 concurrent calls as animated lanes moving through ringing, transcription, Jev intent classification, and queue dispatch. Use the bottom drawer to inject test phrases or trigger a 10-call burst to watch routing under load.
+
+The UI connects to `GET /events` over Server-Sent Events. Both `bun run demo` and production `bun start` stream events through this hub.
+
+## Outbound webhook
+
+Set `WEBHOOK_URL` in `.env` to receive a signed POST request after each call finishes:
+
+```json
+{
+  "event": "call.result",
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "data": {
+    "callId": "...",
+    "outcome": "routed",
+    "route": "sales",
+    "confidence": 0.94
+  }
+}
+```
+
+If `WEBHOOK_SECRET` is set, requests include an `X-Jev-Signature` header containing an HMAC-SHA256 hex digest of the raw body:
+
+```ts
+import crypto from "crypto";
+
+const sig = crypto.createHmac("sha256", process.env.WEBHOOK_SECRET)
+  .update(rawBody)
+  .digest("hex");
+if (sig !== req.headers["x-jev-signature"]) {
+  throw new Error("invalid signature");
+}
+```
+
+Delivery runs in the background with a 4-second timeout so it never blocks PBX call teardown. Failed attempts log a warning without dropping the call.
+
+## Server-Sent Events
+
+`GET /events` streams call state changes:
+
+| Event | Emitted when |
+|---|---|
+| `call.started` | Call accepted by Stasis |
+| `call.speaking` | Speech transcribed |
+| `call.thinking` | Sent to Jev for classification |
+| `call.routed` | Route selected with confidence score |
+| `call.fallback` | Routing fell back to default destination |
+| `call.ended` | Call finished |
+
+```js
+const events = new EventSource("http://localhost:3000/events");
+events.addEventListener("call.routed", (e) => {
+  const { callId, route, confidence } = JSON.parse(e.data);
+  console.log(callId, "->", route, confidence);
+});
+```
+
+`POST /simulate` triggers a scripted call through the real routing pipeline and emits the same events, useful for building external dashboards without an active PBX.
 
 ## Tests and development
 

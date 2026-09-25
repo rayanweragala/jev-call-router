@@ -8,6 +8,7 @@ import {
   validateConfig,
 } from "./config.ts";
 import { describeError, silentLogger } from "./logger.ts";
+import { eventHub } from "./events.ts";
 import {
   CallEndedError,
   InvalidDecisionError,
@@ -85,6 +86,11 @@ export function createCallRouter(config: CallRouterConfig): CallRouter {
   async function handleCall(session: CallSession): Promise<RoutingResult> {
     const trace = startTrace(session.call);
     logger.info("call.started", { callId: trace.call.id });
+    eventHub.emit("call.started", {
+      callId: trace.call.id,
+      caller: trace.call.caller ?? "Anonymous",
+      dialed: trace.call.dialed,
+    });
     let result: RoutingResult;
     try {
       const step = await chooseRoute(session, trace);
@@ -99,6 +105,11 @@ export function createCallRouter(config: CallRouterConfig): CallRouter {
   async function routeTranscript(call: CallInfo, utterances: string[]): Promise<RoutingResult> {
     const trace = startTrace(call);
     trace.attempts = 1;
+    eventHub.emit("call.started", {
+      callId: trace.call.id,
+      caller: trace.call.caller ?? "Anonymous",
+      dialed: trace.call.dialed,
+    });
     const direct = directStep(call);
     const step = direct ?? toFinal(await decide(call, utterances, trace));
     const result = buildResult(trace, step);
@@ -125,6 +136,11 @@ export function createCallRouter(config: CallRouterConfig): CallRouter {
         continue;
       }
       utterances.push(heard.value);
+      eventHub.emit("call.speaking", {
+        callId: trace.call.id,
+        transcript: heard.value,
+        attempt,
+      });
       last = await decide(session.call, utterances, trace);
       if (last.kind !== "retry") {
         return last;
@@ -176,6 +192,11 @@ export function createCallRouter(config: CallRouterConfig): CallRouter {
       callId: call.id,
       routes: offeredRoutes,
       utterances: utterances.length,
+    });
+    eventHub.emit("call.thinking", {
+      callId: call.id,
+      offeredRoutes,
+      utterancesCount: utterances.length,
     });
     const decision = await runStage(trace, "decisionMs", "decision-failed", (signal) =>
       config.decider.decide(context.value, signal),
@@ -243,6 +264,24 @@ export function createCallRouter(config: CallRouterConfig): CallRouter {
     trace: Trace,
   ): Promise<RoutingResult> {
     const route = step.kind === "route" ? step.route : config.fallbackRoute;
+    if (step.kind === "route") {
+      eventHub.emit("call.routed", {
+        callId: trace.call.id,
+        route: step.route,
+        destination: config.routes[step.route]?.action,
+        confidence: step.decision?.confidence,
+        probabilities: step.decision?.probabilities,
+        timings: trace.timings,
+      });
+    } else {
+      eventHub.emit("call.fallback", {
+        callId: trace.call.id,
+        reason: step.reason,
+        route: config.fallbackRoute,
+        destination: config.routes[config.fallbackRoute]?.action,
+        error: step.error,
+      });
+    }
     try {
       await executeRoute(session, route);
       return buildResult(trace, step);
@@ -370,6 +409,13 @@ export function createCallRouter(config: CallRouterConfig): CallRouter {
     } else {
       logger.info("call.routed", fields);
     }
+    eventHub.emit("call.ended", {
+      callId: result.callId,
+      outcome: result.outcome,
+      route: result.route,
+      fallbackReason: result.fallbackReason,
+      timings: result.timings,
+    });
     try {
       await config.onResult?.(result);
     } catch (error) {

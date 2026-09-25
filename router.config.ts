@@ -2,6 +2,7 @@ import {
   createJevDecider,
   createTranscriptionSpeech,
   requireEnv,
+  sendWebhook,
   type CallRouterConfig,
   type Logger,
   type Route,
@@ -59,6 +60,15 @@ export function createRouterConfig(logger: Logger): CallRouterConfig {
     maxAttempts: 2,
     minConfidence: 0.7,
     routeDirectly: (call) => (call.variables.jev === "off" ? "standard-ivr" : undefined),
+    onResult: (result) => {
+      if (process.env.WEBHOOK_URL) {
+        void sendWebhook(result, {
+          url: process.env.WEBHOOK_URL,
+          secret: process.env.WEBHOOK_SECRET,
+          logger,
+        });
+      }
+    },
     logger,
   };
 }

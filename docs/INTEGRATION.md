@@ -6,16 +6,19 @@ This guide connects jev-call-router to a real phone system across three configur
 |---|---|---|
 | External providers | vendor dashboards | TypeSafe (Jev) key, speech-to-text key, optional Anthropic key |
 | PBX | Asterisk / FreePBX | ARI user, one dialplan context, prompt recordings, inbound routing |
-| Application | this repo: `router.config.ts`, `.env` | routes, prompts, fallback, thresholds, provider keys |
+| Application | this repo: `router.config.ts`, `.env` | routes, prompts, fallback, thresholds, provider keys, webhook |
 
 ## How the pieces talk
 
 ```
-Caller ──SIP/PSTN──▶ Asterisk ──Stasis(jev-router)──▶ ARI WebSocket events ──▶ jev-call-router
-                        ▲                                                       │
-                        └──── ARI REST: answer, play, record, continue ◀───────┘
-                                                                                ├─▶ speech-to-text API
-                                                                                └─▶ Jev (api.typesafe.ai)
+Caller --SIP/PSTN--> Asterisk --Stasis(jev-router)--> ARI WebSocket events --> jev-call-router
+                        ^                                                       |
+                        +---- ARI REST: answer, play, record, continue <-------+
+                                                                               |
+                                                              +----------------+----------------+
+                                                              |                |                |
+                                                    speech-to-text API    Jev API         WEBHOOK_URL
+                                                                                        (optional POST)
 ```
 
 The router opens one outbound WebSocket to Asterisk (`/ari/events?app=jev-router`) and makes REST calls to it. Asterisk never calls the router, so the router can run on the PBX host or on another machine that can reach port 8088.
@@ -28,15 +31,17 @@ For each call the adapter:
 4. downloads and deletes the recording (`/recordings/stored/{name}/file`),
 5. sends the audio to speech-to-text and the text to Jev,
 6. plays the route's announcement, if any,
-7. calls `POST /channels/{id}/continue?context=…&extension=…&priority=…`, which leaves Stasis and resumes the dialplan at the chosen destination.
+7. calls `POST /channels/{id}/continue?context=…&extension=…&priority=…`, which leaves Stasis and resumes the dialplan at the chosen destination,
+8. fires `onResult(result)`, which delivers the outcome to your webhook if `WEBHOOK_URL` is set.
 
 ## External providers
 
 1. Jev / TypeSafe: Create an API key in your TypeSafe account ([docs.typesafe.ai](https://docs.typesafe.ai)) and add it to `.env` as `TYPESAFE_API_KEY`.
 2. Speech-to-text: Any service with an OpenAI-style `POST {base}/audio/transcriptions` endpoint (multipart `file` + `model`, JSON `{ "text": … }` response) works. Set `STT_API_KEY`, `STT_BASE_URL` (for example `https://api.openai.com/v1`), and `STT_MODEL` to a transcription model your provider offers. Asterisk records 8 kHz mono WAV, which these services accept.
 3. Optional interpreter: To send Jev a short summary with personal details removed instead of the raw transcript, add `interpreter: createClaudeInterpreter()` to your config and set `ANTHROPIC_API_KEY`. It uses `claude-opus-5` at low effort, with server-side refusal fallbacks enabled. It adds one model call of latency per attempt.
+4. Optional webhook: Set `WEBHOOK_URL` to receive a signed HTTP POST for every routing outcome. See [Outbound webhook](#outbound-webhook) below.
 
-The router's host needs outbound HTTPS to `api.typesafe.ai`, your STT host, and (optionally) `api.anthropic.com`.
+The router's host needs outbound HTTPS to `api.typesafe.ai`, your STT host, and (optionally) `api.anthropic.com` and your webhook host.
 
 ## PBX configuration
 
@@ -100,7 +105,7 @@ Everything lives in [`router.config.ts`](../router.config.ts):
 ```ts
 export const routes: Record<string, Route> = {
   billing: {
-    description: "Questions about invoices, charges, refunds, payments.",   // offered to Jev
+    description: "Questions about invoices, charges, refunds, payments.",
     action: { type: "transfer", destination: "ext-queues,402,1" },
   },
   "human-agent": {
@@ -108,7 +113,7 @@ export const routes: Record<string, Route> = {
     action: { type: "transfer", destination: "from-did-direct,100,1" },
     announcement: "sound:custom/jev-connecting",
   },
-  "standard-ivr": { action: { type: "continue" } },                         // not offered to Jev
+  "standard-ivr": { action: { type: "continue" } },
 };
 export const fallbackRoute = "human-agent";
 ```
@@ -126,7 +131,7 @@ Options on `createCallRouter`:
 | `routeDirectly(call)` | none | Return a route name to skip Jev for this call |
 | `facts(call)` | none | Extra facts for Jev, for example `{ afterHours: true }` |
 | `interpreter` | none | Summarize the transcript before Jev sees it |
-| `onResult(result)` | none | Receives each `RoutingResult`. Use it for webhooks, metrics, or audit logs |
+| `onResult(result)` | none | Receives each `RoutingResult`. Wire `sendWebhook` here to push outcomes to your CRM or dashboard |
 | `logger` | silent | `createJsonLogger()` writes JSON lines to stdout |
 
 ### Passing information from the dialplan
@@ -147,6 +152,97 @@ facts: (call) => ({ line: call.variables.line ?? "main" }),
 ### Asterisk adapter options
 
 `connectAsterisk({ url, username, password, app, router, recording: { maxSeconds, maxSilenceSeconds }, reconnectDelayMs, logger })`. `bun start` (`src/server.ts`) wires this up from `.env`. At startup it validates every `transfer` destination and fails fast on a malformed one. If the event WebSocket drops, the adapter reconnects every 3 s. Calls in progress fall back through ARI REST.
+
+## Outbound webhook
+
+After every call, the router calls your `onResult` handler with a `RoutingResult`. Wire `sendWebhook` to push it to any HTTP endpoint:
+
+```ts
+import { sendWebhook } from "./src/webhook.ts";
+
+onResult: (result) => {
+  void sendWebhook(result, {
+    url: process.env.WEBHOOK_URL,
+    secret: process.env.WEBHOOK_SECRET,
+    logger,
+  });
+},
+```
+
+Delivery runs asynchronously with a 4-second timeout so PBX teardown is never delayed. Failed deliveries log a warning without dropping the call. The request body:
+
+```json
+{
+  "event": "call.result",
+  "timestamp": "2026-01-01T12:00:00.000Z",
+  "data": {
+    "callId": "...",
+    "outcome": "routed",
+    "route": "sales",
+    "confidence": 0.94,
+    "attempts": 1,
+    "timings": { "decisionMs": 420, "totalMs": 1850 }
+  }
+}
+```
+
+### Signature verification
+
+When `WEBHOOK_SECRET` is configured, requests include an `X-Jev-Signature` header with an HMAC-SHA256 hex digest of the raw request body:
+
+```ts
+import { createHmac } from "crypto";
+
+function verify(rawBody: string, secret: string, signatureHeader: string): boolean {
+  const expected = createHmac("sha256", secret).update(rawBody).digest("hex");
+  return expected === signatureHeader;
+}
+```
+
+## Live visualizer
+
+Run `bun run demo` and open `http://localhost:3000`.
+
+The visualizer requires a `TYPESAFE_API_KEY` for Jev decisions, but no Asterisk PBX or speech-to-text setup is needed because inputs are submitted as text. Up to 10 concurrent calls are displayed across animated lanes as they move through transcription, Jev classification, and queue routing.
+
+Events stream to the browser via Server-Sent Events (`GET /events`). The production server (`bun start`) also emits to this hub when the HTTP server is enabled.
+
+### SSE event reference
+
+`GET /events` (text/event-stream):
+
+| Event | Fields | Emitted when |
+|---|---|---|
+| `call.started` | `callId`, `caller`, `timestamp` | Call entered Stasis |
+| `call.speaking` | `callId`, `transcript` | Transcript segment ready |
+| `call.thinking` | `callId` | Classification request sent to Jev |
+| `call.routed` | `callId`, `route`, `confidence`, `destination` | Route selected with confidence score |
+| `call.fallback` | `callId`, `reason` | Router diverted to fallback destination |
+| `call.ended` | `callId`, `outcome` | Call session completed |
+
+### Simulate endpoint
+
+`POST /simulate` runs a scripted call through the real routing pipeline and emits the same SSE events:
+
+```bash
+curl -X POST http://localhost:3000/simulate \
+  -H "Content-Type: application/json" \
+  -d '{"utterance": "I was charged twice"}'
+```
+
+Multiple utterances (for retry flows):
+
+```bash
+curl -X POST http://localhost:3000/simulate \
+  -H "Content-Type: application/json" \
+  -d '{"utterances": ["hello?", "I need billing help"]}'
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "callId": "...", "outcome": "routed", "route": "billing", ... } }
+```
 
 ## Trying it without a PBX
 

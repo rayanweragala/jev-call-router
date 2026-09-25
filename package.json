@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "bun run src/server.ts",
+    "demo": "bun run src/demo-server.ts",
     "simulate": "bun run scripts/simulate.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
